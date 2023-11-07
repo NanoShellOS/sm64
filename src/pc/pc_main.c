@@ -17,6 +17,7 @@
 #include "gfx/gfx_dxgi.h"
 #include "gfx/gfx_glx.h"
 #include "gfx/gfx_sdl.h"
+#include "gfx/gfx_nanoshell.h"
 #include "gfx/gfx_dummy.h"
 
 #include "audio/audio_api.h"
@@ -171,6 +172,9 @@ void main_func(void) {
     #else
         wm_api = &gfx_sdl;
     #endif
+#elif defined(ENABLE_WM_NANOSHELL)
+    rendering_api = &gfx_nanoshell_renderer_api;
+	wm_api = &gfx_nanoshell_wm_api;
 #elif defined(ENABLE_GFX_DUMMY)
     rendering_api = &gfx_dummy_renderer_api;
     wm_api = &gfx_dummy_wm_api;

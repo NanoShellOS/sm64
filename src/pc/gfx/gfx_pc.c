@@ -158,12 +158,25 @@ static size_t buf_vbo_num_tris;
 static struct GfxWindowManagerAPI *gfx_wapi;
 static struct GfxRenderingAPI *gfx_rapi;
 
+#ifdef TARGET_NANOSHELL
+
+#include <nanoshell/nanoshell.h>
+
+static unsigned long get_time(void) {
+	return (unsigned long)GetTickCount() * 1000UL;
+}
+
+#else
+
 #include <time.h>
+
 static unsigned long get_time(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
+
+#endif
 
 static void gfx_flush(void) {
     if (buf_vbo_len > 0) {

@@ -53,6 +53,9 @@ build/*
 sm64_save_file.bin
 sm64config.txt
 
+# NanoShell specific target.
+sm64.nse
+
 # Assets. Generally ignored, but ones with "custom" in the name are fine.
 /levels/**/*.png
 /actors/**/*.png
