@@ -302,15 +302,30 @@ static void gfx_nanoshell_renderer_set_use_alpha(bool use_alpha) {
     }
 }
 
+static float rand_float(void) {
+	int x = rand() & 0x7FFF;
+	
+	return (float)x / (float)0x7FFF;
+}
+
 static void gfx_nanoshell_renderer_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
+	
     //glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STATIC_DRAW);
     //glDrawArrays(GL_TRIANGLES, 0, 3 * buf_vbo_num_tris);
 	
+	const size_t num_verts = buf_vbo_num_tris * 3;
+	const size_t stride = buf_vbo_len / num_verts; // hack!!
+	
+	LogMsg("BufVboLen: %d    BufVboNumTris: %d    Stride: %d", buf_vbo_len, buf_vbo_num_tris, stride);
+	
+	glColor4f(rand_float(), rand_float(), rand_float(), 1.0f);
+	
 	glBegin(GL_TRIANGLES);
 	
-	for (size_t i = 0; i < buf_vbo_len; i++) {
-		glVertex3f(buf_vbo[0], buf_vbo[1], buf_vbo[2]);
-		buf_vbo += 3;
+	for (size_t i = 0, j; i < num_verts; i++, j += stride) {
+		
+		float* v1= buf_vbo + j;
+		glVertex3f(v1[0],v1[1],v1[2]);
 	}
 	
 	glEnd();
@@ -343,7 +358,6 @@ static void gfx_nanoshell_renderer_start_frame(void) {
 }
 
 static void gfx_nanoshell_renderer_end_frame(void) {
-	glDrawText("test", 1, 1, 0xffffff);
 }
 
 static void gfx_nanoshell_renderer_finish_render(void) {
