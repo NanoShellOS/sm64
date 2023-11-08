@@ -1,7 +1,8 @@
-#ifdef ENABLE_OPENGL
+#if defined(ENABLE_OPENGL) && !defined(ENABLE_OPENGL_LEGACY)
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 #ifndef _LANGUAGE_C
 #define _LANGUAGE_C
@@ -14,15 +15,21 @@
 #define FOR_WINDOWS 0
 #endif
 
+#define GL_GLEXT_PROTOTYPES 1
+
 #if FOR_WINDOWS
-#include <GL/glew.h>
-#include "SDL.h"
-#define GL_GLEXT_PROTOTYPES 1
-#include "SDL_opengl.h"
+# include <GL/glew.h>
+# include "SDL.h"
+# include "SDL_opengl.h"
+#elif defined(TARGET_DOS)
+# include <stdio.h>
+# include <string.h>
+# include <stdlib.h>
+# include <GL/gl.h>
+# include <GL/glext.h>
 #else
-#include <SDL2/SDL.h>
-#define GL_GLEXT_PROTOTYPES 1
-#include <SDL2/SDL_opengles2.h>
+# include <SDL2/SDL.h>
+# include <SDL2/SDL_opengles2.h>
 #endif
 
 #include "gfx_cc.h"
@@ -48,6 +55,10 @@ static GLuint opengl_vbo;
 
 static uint32_t frame_count;
 static uint32_t current_height;
+
+#ifdef TARGET_DOS
+extern uint32_t *osmesa_buffer;
+#endif
 
 static bool gfx_opengl_z_is_from_0_to_1(void) {
     return false;
@@ -475,11 +486,11 @@ static void gfx_opengl_init(void) {
 #if FOR_WINDOWS
     glewInit();
 #endif
-    
+
     glGenBuffers(1, &opengl_vbo);
-    
+
     glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
-    
+
     glDepthFunc(GL_LEQUAL);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 }
@@ -525,7 +536,11 @@ struct GfxRenderingAPI gfx_opengl_api = {
     gfx_opengl_on_resize,
     gfx_opengl_start_frame,
     gfx_opengl_end_frame,
-    gfx_opengl_finish_render
+    gfx_opengl_finish_render,
+    NULL,
+    NULL,
+    NULL,
+    NULL
 };
 
 #endif

@@ -1,4 +1,4 @@
-#ifdef __linux__
+#if defined __linux__ && !defined(TARGET_NANOSHELL)
 
 #include <stdbool.h>
 #include <pthread.h>

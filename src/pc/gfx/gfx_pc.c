@@ -16,6 +16,8 @@
 #include "gfx_rendering_api.h"
 #include "gfx_screen_config.h"
 
+#include "pc/configfile.h"
+
 #define SUPPORT_CHECK(x) assert(x)
 
 // SCALE_M_N: upscale/downscale M-bit integer to N-bit
@@ -31,12 +33,46 @@
 #define HALF_SCREEN_WIDTH (SCREEN_WIDTH / 2)
 #define HALF_SCREEN_HEIGHT (SCREEN_HEIGHT / 2)
 
-#define RATIO_X (gfx_current_dimensions.width / (2.0f * HALF_SCREEN_WIDTH))
-#define RATIO_Y (gfx_current_dimensions.height / (2.0f * HALF_SCREEN_HEIGHT))
-
 #define MAX_BUFFERED 256
 #define MAX_LIGHTS 2
 #define MAX_VERTICES 64
+
+// clip triangles for the software rasterizer in advance
+#define GFX_MANUAL_CLIPPING 1
+
+#ifdef ENABLE_SOFTRAST
+// leave colors as 0-255 floats
+#define GFX_DONT_SCALE_COLORS 1
+// don't put in fog color
+#define GFX_NO_FOG_COLOR 1
+// premultiply by W
+#define GFX_W_PREMULT 1
+#endif
+
+#ifdef GFX_DONT_SCALE_COLORS
+#define GFX_COLOR_ONE 255.f
+#define GFX_COLOR_CONVERT(x) (x)
+#else
+#define GFX_COLOR_ONE 1.f
+#define GFX_COLOR_CONVERT(x) (x / 255.f)
+#endif
+
+#ifdef GFX_W_PREMULT
+#define GFX_OUT_PROP(x) ((x) * w_inv)
+#else
+#define GFX_OUT_PROP(x) (x)
+#endif
+
+enum {
+    CLIP_NONE   = 0,
+    CLIP_NEAR   = 1,
+    CLIP_FAR    = 2,
+    CLIP_TOP    = 4,
+    CLIP_BOTTOM = 8,
+    CLIP_RIGHT  = 16,
+    CLIP_LEFT   = 32,
+    CLIP_ALL    = 63,
+};
 
 struct RGBA {
     uint8_t r, g, b, a;
@@ -55,10 +91,10 @@ struct LoadedVertex {
 
 struct TextureHashmapNode {
     struct TextureHashmapNode *next;
-    
+
     const uint8_t *texture_addr;
     uint8_t fmt, siz;
-    
+
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
@@ -81,24 +117,24 @@ static uint8_t color_combiner_pool_size;
 static struct RSP {
     float modelview_matrix_stack[11][4][4];
     uint8_t modelview_matrix_stack_size;
-    
+
     float MP_matrix[4][4];
     float P_matrix[4][4];
-    
+
     Light_t current_lights[MAX_LIGHTS + 1];
     float current_lights_coeffs[MAX_LIGHTS][3];
     float current_lookat_coeffs[2][3]; // lookat_x, lookat_y
     uint8_t current_num_lights; // includes ambient light
     bool lights_changed;
-    
+
     uint32_t geometry_mode;
     int16_t fog_mul, fog_offset;
-    
+
     struct {
         // U0.16
         uint16_t s, t;
     } texture_scaling_factor;
-    
+
     struct LoadedVertex loaded_vertices[MAX_VERTICES + 4];
 
     uint8_t saved_opcode;
@@ -126,10 +162,10 @@ static struct RDP {
         uint32_t line_size_bytes;
     } texture_tile;
     bool textures_changed[2];
-    
+
     uint32_t other_mode_l, other_mode_h;
     uint32_t combine_mode;
-    
+
     struct RGBA env_color, prim_color, fog_color, fill_color;
     struct XYWidthHeight viewport, scissor;
     bool viewport_or_scissor_changed;
@@ -148,6 +184,10 @@ static struct RenderingState {
 } rendering_state;
 
 struct GfxDimensions gfx_current_dimensions;
+static float ratio_x = 1.f;
+static float ratio_y = 1.f;
+static float inv_ratio_x = 1.f;
+static float inv_ratio_y = 1.f;
 
 static bool dropped_frame;
 
@@ -158,37 +198,12 @@ static size_t buf_vbo_num_tris;
 static struct GfxWindowManagerAPI *gfx_wapi;
 static struct GfxRenderingAPI *gfx_rapi;
 
-#ifdef TARGET_NANOSHELL
-
-#include <nanoshell/nanoshell.h>
-
-static unsigned long get_time(void) {
-	return (unsigned long)GetTickCount() * 1000UL;
-}
-
-#else
-
-#include <time.h>
-
-static unsigned long get_time(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (unsigned long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-#endif
-
 static void gfx_flush(void) {
     if (buf_vbo_len > 0) {
         int num = buf_vbo_num_tris;
-        unsigned long t0 = get_time();
         gfx_rapi->draw_triangles(buf_vbo, buf_vbo_len, buf_vbo_num_tris);
         buf_vbo_len = 0;
         buf_vbo_num_tris = 0;
-        unsigned long t1 = get_time();
-        /*if (t1 - t0 > 1000) {
-            printf("f: %d %d\n", num, (int)(t1 - t0));
-        }*/
     }
 }
 
@@ -254,7 +269,7 @@ static struct ColorCombiner *gfx_lookup_or_create_color_combiner(uint32_t cc_id)
     if (prev_combiner != NULL && prev_combiner->cc_id == cc_id) {
         return prev_combiner;
     }
-    
+
     for (size_t i = 0; i < color_combiner_pool_size; i++) {
         if (color_combiner_pool[i].cc_id == cc_id) {
             return prev_combiner = &color_combiner_pool[i];
@@ -303,7 +318,7 @@ static bool gfx_texture_cache_lookup(int tile, struct TextureHashmapNode **n, co
 
 static void import_texture_rgba16(int tile) {
     uint8_t rgba32_buf[8192];
-    
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes / 2; i++) {
         uint16_t col16 = (rdp.loaded_texture[tile].addr[2 * i] << 8) | rdp.loaded_texture[tile].addr[2 * i + 1];
         uint8_t a = col16 & 1;
@@ -315,10 +330,10 @@ static void import_texture_rgba16(int tile) {
         rgba32_buf[4*i + 2] = SCALE_5_8(b);
         rgba32_buf[4*i + 3] = a ? 255 : 0;
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes / 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
+
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
@@ -330,7 +345,7 @@ static void import_texture_rgba32(int tile) {
 
 static void import_texture_ia4(int tile) {
     uint8_t rgba32_buf[32768];
-    
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes * 2; i++) {
         uint8_t byte = rdp.loaded_texture[tile].addr[i / 2];
         uint8_t part = (byte >> (4 - (i % 2) * 4)) & 0xf;
@@ -344,16 +359,16 @@ static void import_texture_ia4(int tile) {
         rgba32_buf[4*i + 2] = SCALE_3_8(b);
         rgba32_buf[4*i + 3] = alpha ? 255 : 0;
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes * 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
+
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
 static void import_texture_ia8(int tile) {
     uint8_t rgba32_buf[16384];
-    
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes; i++) {
         uint8_t intensity = rdp.loaded_texture[tile].addr[i] >> 4;
         uint8_t alpha = rdp.loaded_texture[tile].addr[i] & 0xf;
@@ -365,16 +380,16 @@ static void import_texture_ia8(int tile) {
         rgba32_buf[4*i + 2] = SCALE_4_8(b);
         rgba32_buf[4*i + 3] = SCALE_4_8(alpha);
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
+
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
 static void import_texture_ia16(int tile) {
     uint8_t rgba32_buf[8192];
-    
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes / 2; i++) {
         uint8_t intensity = rdp.loaded_texture[tile].addr[2 * i];
         uint8_t alpha = rdp.loaded_texture[tile].addr[2 * i + 1];
@@ -386,10 +401,10 @@ static void import_texture_ia16(int tile) {
         rgba32_buf[4*i + 2] = b;
         rgba32_buf[4*i + 3] = alpha;
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes / 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
+
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
@@ -438,7 +453,7 @@ static void import_texture_i8(int tile) {
 
 static void import_texture_ci4(int tile) {
     uint8_t rgba32_buf[32768];
-    
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes * 2; i++) {
         uint8_t byte = rdp.loaded_texture[tile].addr[i / 2];
         uint8_t idx = (byte >> (4 - (i % 2) * 4)) & 0xf;
@@ -452,16 +467,16 @@ static void import_texture_ci4(int tile) {
         rgba32_buf[4*i + 2] = SCALE_5_8(b);
         rgba32_buf[4*i + 3] = a ? 255 : 0;
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes * 2;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
+
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
 static void import_texture_ci8(int tile) {
     uint8_t rgba32_buf[16384];
-    
+
     for (uint32_t i = 0; i < rdp.loaded_texture[tile].size_bytes; i++) {
         uint8_t idx = rdp.loaded_texture[tile].addr[i];
         uint16_t col16 = (rdp.palette[idx * 2] << 8) | rdp.palette[idx * 2 + 1]; // Big endian load
@@ -474,22 +489,21 @@ static void import_texture_ci8(int tile) {
         rgba32_buf[4*i + 2] = SCALE_5_8(b);
         rgba32_buf[4*i + 3] = a ? 255 : 0;
     }
-    
+
     uint32_t width = rdp.texture_tile.line_size_bytes;
     uint32_t height = rdp.loaded_texture[tile].size_bytes / rdp.texture_tile.line_size_bytes;
-    
+
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
 static void import_texture(int tile) {
     uint8_t fmt = rdp.texture_tile.fmt;
     uint8_t siz = rdp.texture_tile.siz;
-    
+
     if (gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr, fmt, siz)) {
         return;
     }
-    
-    int t0 = get_time();
+
     if (fmt == G_IM_FMT_RGBA) {
         if (siz == G_IM_SIZ_16b) {
             import_texture_rgba16(tile);
@@ -527,24 +541,32 @@ static void import_texture(int tile) {
     } else {
         abort();
     }
-    int t1 = get_time();
-    //printf("Time diff: %d\n", t1 - t0);
 }
 
-static void gfx_normalize_vector(float v[3]) {
-    float s = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-    v[0] /= s;
-    v[1] /= s;
-    v[2] /= s;
+static inline float rsqrtf(const float x) {
+    const float x2 = x * 0.5f;
+    float y = x;
+    int32_t i = *(int32_t *)&y;
+    i = 0x5f3759df - (i >> 1);
+    y = *(float *)&i;
+    y = y * (1.5f - (x2 * y * y));
+    return y;
 }
 
-static void gfx_transposed_matrix_mul(float res[3], const float a[3], const float b[4][4]) {
+static inline void gfx_normalize_vector(float v[3]) {
+    const float s = rsqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    v[0] *= s;
+    v[1] *= s;
+    v[2] *= s;
+}
+
+static inline void gfx_transposed_matrix_mul(float *restrict res, const float *restrict a, const float (*restrict b)[4]) {
     res[0] = a[0] * b[0][0] + a[1] * b[0][1] + a[2] * b[0][2];
     res[1] = a[0] * b[1][0] + a[1] * b[1][1] + a[2] * b[1][2];
     res[2] = a[0] * b[2][0] + a[1] * b[2][1] + a[2] * b[2][2];
 }
 
-static void calculate_normal_dir(const Light_t *light, float coeffs[3]) {
+static inline void calculate_normal_dir(const Light_t *light, float coeffs[3]) {
     float light_dir[3] = {
         light->dir[0] / 127.0f,
         light->dir[1] / 127.0f,
@@ -554,41 +576,54 @@ static void calculate_normal_dir(const Light_t *light, float coeffs[3]) {
     gfx_normalize_vector(coeffs);
 }
 
-static void gfx_matrix_mul(float res[4][4], const float a[4][4], const float b[4][4]) {
+static inline void gfx_matrix_mul_inplace(const float (*restrict a)[4], float (*restrict res)[4]) {
     float tmp[4][4];
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
-            tmp[i][j] = a[i][0] * b[0][j] +
+            tmp[i][j] = a[i][0] * res[0][j] +
+                        a[i][1] * res[1][j] +
+                        a[i][2] * res[2][j] +
+                        a[i][3] * res[3][j];
+        }
+    }
+    memcpy(res, tmp, sizeof(tmp));
+}
+
+static inline void gfx_matrix_mul(float (*restrict res)[4], const float (*restrict a)[4], const float (*restrict b)[4]) {
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            res[i][j] = a[i][0] * b[0][j] +
                         a[i][1] * b[1][j] +
                         a[i][2] * b[2][j] +
                         a[i][3] * b[3][j];
         }
     }
-    memcpy(res, tmp, sizeof(tmp));
 }
 
 static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
     float matrix[4][4];
 #ifndef GBI_FLOATS
     // Original GBI where fixed point matrices are used
+    register int idx;
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j += 2) {
-            int32_t int_part = addr[i * 2 + j / 2];
-            uint32_t frac_part = addr[8 + i * 2 + j / 2];
-            matrix[i][j] = (int32_t)((int_part & 0xffff0000) | (frac_part >> 16)) / 65536.0f;
-            matrix[i][j + 1] = (int32_t)((int_part << 16) | (frac_part & 0xffff)) / 65536.0f;
+            idx = (i << 1) + (j >> 1);
+            const int32_t int_part = addr[idx];
+            const uint32_t frac_part = addr[8 + idx];
+            matrix[i][j] = (int32_t)((int_part & 0xffff0000) | (frac_part >> 16)) / 65536.f;
+            matrix[i][j + 1] = (int32_t)((int_part << 16) | (frac_part & 0xffff)) / 65536.f;
         }
     }
 #else
     // For a modified GBI where fixed point values are replaced with floats
     memcpy(matrix, addr, sizeof(matrix));
 #endif
-    
+
     if (parameters & G_MTX_PROJECTION) {
         if (parameters & G_MTX_LOAD) {
             memcpy(rsp.P_matrix, matrix, sizeof(matrix));
         } else {
-            gfx_matrix_mul(rsp.P_matrix, matrix, rsp.P_matrix);
+            gfx_matrix_mul_inplace(matrix, rsp.P_matrix);
         }
     } else { // G_MTX_MODELVIEW
         if ((parameters & G_MTX_PUSH) && rsp.modelview_matrix_stack_size < 11) {
@@ -598,7 +633,7 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
         if (parameters & G_MTX_LOAD) {
             memcpy(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], matrix, sizeof(matrix));
         } else {
-            gfx_matrix_mul(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
+            gfx_matrix_mul_inplace(matrix, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1]);
         }
         rsp.lights_changed = 1;
     }
@@ -616,8 +651,8 @@ static void gfx_sp_pop_matrix(uint32_t count) {
     }
 }
 
-static float gfx_adjust_x_for_aspect_ratio(float x) {
-    return x * (4.0f / 3.0f) / ((float)gfx_current_dimensions.width / (float)gfx_current_dimensions.height);
+static inline float gfx_adjust_x_for_aspect_ratio(float x) {
+    return x * (4.0f / 3.0f) / (float)gfx_current_dimensions.aspect_ratio;
 }
 
 static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
@@ -625,17 +660,17 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
         const Vtx_t *v = &vertices[i].v;
         const Vtx_tn *vn = &vertices[i].n;
         struct LoadedVertex *d = &rsp.loaded_vertices[dest_index];
-        
+
         float x = v->ob[0] * rsp.MP_matrix[0][0] + v->ob[1] * rsp.MP_matrix[1][0] + v->ob[2] * rsp.MP_matrix[2][0] + rsp.MP_matrix[3][0];
         float y = v->ob[0] * rsp.MP_matrix[0][1] + v->ob[1] * rsp.MP_matrix[1][1] + v->ob[2] * rsp.MP_matrix[2][1] + rsp.MP_matrix[3][1];
         float z = v->ob[0] * rsp.MP_matrix[0][2] + v->ob[1] * rsp.MP_matrix[1][2] + v->ob[2] * rsp.MP_matrix[2][2] + rsp.MP_matrix[3][2];
         float w = v->ob[0] * rsp.MP_matrix[0][3] + v->ob[1] * rsp.MP_matrix[1][3] + v->ob[2] * rsp.MP_matrix[2][3] + rsp.MP_matrix[3][3];
-        
+
         x = gfx_adjust_x_for_aspect_ratio(x);
-        
+
         short U = v->tc[0] * rsp.texture_scaling_factor.s >> 16;
         short V = v->tc[1] * rsp.texture_scaling_factor.t >> 16;
-        
+
         if (rsp.geometry_mode & G_LIGHTING) {
             if (rsp.lights_changed) {
                 for (int i = 0; i < rsp.current_num_lights - 1; i++) {
@@ -647,11 +682,11 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
                 calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[1]);
                 rsp.lights_changed = false;
             }
-            
+
             int r = rsp.current_lights[rsp.current_num_lights - 1].col[0];
             int g = rsp.current_lights[rsp.current_num_lights - 1].col[1];
             int b = rsp.current_lights[rsp.current_num_lights - 1].col[2];
-            
+
             for (int i = 0; i < rsp.current_num_lights - 1; i++) {
                 float intensity = 0;
                 intensity += vn->n[0] * rsp.current_lights_coeffs[i][0];
@@ -664,11 +699,11 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
                     b += intensity * rsp.current_lights[i].col[2];
                 }
             }
-            
+
             d->color.r = r > 255 ? 255 : r;
             d->color.g = g > 255 ? 255 : g;
             d->color.b = b > 255 ? 255 : b;
-            
+
             if (rsp.geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
                 dotx += vn->n[0] * rsp.current_lookat_coeffs[0][0];
@@ -677,7 +712,7 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
                 doty += vn->n[0] * rsp.current_lookat_coeffs[1][0];
                 doty += vn->n[1] * rsp.current_lookat_coeffs[1][1];
                 doty += vn->n[2] * rsp.current_lookat_coeffs[1][2];
-                
+
                 U = (int32_t)((dotx / 127.0f + 1.0f) / 4.0f * rsp.texture_scaling_factor.s);
                 V = (int32_t)((doty / 127.0f + 1.0f) / 4.0f * rsp.texture_scaling_factor.t);
             }
@@ -686,35 +721,27 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
             d->color.g = v->cn[1];
             d->color.b = v->cn[2];
         }
-        
+
         d->u = U;
         d->v = V;
-        
+
         // trivial clip rejection
         d->clip_rej = 0;
-        if (x < -w) d->clip_rej |= 1;
-        if (x > w) d->clip_rej |= 2;
-        if (y < -w) d->clip_rej |= 4;
-        if (y > w) d->clip_rej |= 8;
-        if (z < -w) d->clip_rej |= 16;
-        if (z > w) d->clip_rej |= 32;
-        
+        if (x < -w) d->clip_rej |= CLIP_LEFT;
+        if (x >  w) d->clip_rej |= CLIP_RIGHT;
+        if (y < -w) d->clip_rej |= CLIP_BOTTOM;
+        if (y >  w) d->clip_rej |= CLIP_TOP;
+        if (z < -w) d->clip_rej |= CLIP_FAR;
+        if (z >  w) d->clip_rej |= CLIP_NEAR;
+
         d->x = x;
         d->y = y;
         d->z = z;
         d->w = w;
-        
-        if (rsp.geometry_mode & G_FOG) {
-            if (fabsf(w) < 0.001f) {
-                // To avoid division by zero
-                w = 0.001f;
-            }
-            
-            float winv = 1.0f / w;
-            if (winv < 0.0f) {
-                winv = 32767.0f;
-            }
-            
+
+        if (configEnableFog && (rsp.geometry_mode & G_FOG)) {
+            w = (w == 0.f) ? 1.f / 0.001f : 1.f / w;
+            const float winv = w < 0.0f ? 32767.0f : w;
             float fog_z = z * winv * rsp.fog_mul + rsp.fog_offset;
             if (fog_z < 0) fog_z = 0;
             if (fog_z > 255) fog_z = 255;
@@ -725,100 +752,27 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *verti
     }
 }
 
-static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
-    struct LoadedVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
-    struct LoadedVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
-    struct LoadedVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
-    struct LoadedVertex *v_arr[3] = {v1, v2, v3};
-    
-    //if (rand()%2) return;
-    
-    if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
-        // The whole triangle lies outside the visible area
-        return;
-    }
-    
-    if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
-        float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
-        float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
-        float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
-        float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
-        float cross = dx1 * dy2 - dy1 * dx2;
-        
-        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
-            // If one vertex lies behind the eye, negating cross will give the correct result.
-            // If all vertices lie behind the eye, the triangle will be rejected anyway.
-            cross = -cross;
-        }
-        
-        switch (rsp.geometry_mode & G_CULL_BOTH) {
-            case G_CULL_FRONT:
-                if (cross <= 0) return;
-                break;
-            case G_CULL_BACK:
-                if (cross >= 0) return;
-                break;
-            case G_CULL_BOTH:
-                // Why is this even an option?
-                return;
-        }
-    }
-    
-    bool depth_test = (rsp.geometry_mode & G_ZBUFFER) == G_ZBUFFER;
-    if (depth_test != rendering_state.depth_test) {
-        gfx_flush();
-        gfx_rapi->set_depth_test(depth_test);
-        rendering_state.depth_test = depth_test;
-    }
-    
-    bool z_upd = (rdp.other_mode_l & Z_UPD) == Z_UPD;
-    if (z_upd != rendering_state.depth_mask) {
-        gfx_flush();
-        gfx_rapi->set_depth_mask(z_upd);
-        rendering_state.depth_mask = z_upd;
-    }
-    
-    bool zmode_decal = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
-    if (zmode_decal != rendering_state.decal_mode) {
-        gfx_flush();
-        gfx_rapi->set_zmode_decal(zmode_decal);
-        rendering_state.decal_mode = zmode_decal;
-    }
-    
-    if (rdp.viewport_or_scissor_changed) {
-        if (memcmp(&rdp.viewport, &rendering_state.viewport, sizeof(rdp.viewport)) != 0) {
-            gfx_flush();
-            gfx_rapi->set_viewport(rdp.viewport.x, rdp.viewport.y, rdp.viewport.width, rdp.viewport.height);
-            rendering_state.viewport = rdp.viewport;
-        }
-        if (memcmp(&rdp.scissor, &rendering_state.scissor, sizeof(rdp.scissor)) != 0) {
-            gfx_flush();
-            gfx_rapi->set_scissor(rdp.scissor.x, rdp.scissor.y, rdp.scissor.width, rdp.scissor.height);
-            rendering_state.scissor = rdp.scissor;
-        }
-        rdp.viewport_or_scissor_changed = false;
-    }
-    
+static inline struct ColorCombiner *gfx_pick_combiner(bool *out_use_fog, bool *out_use_alpha) {
     uint32_t cc_id = rdp.combine_mode;
-    
+
     bool use_alpha = (rdp.other_mode_l & (G_BL_A_MEM << 18)) == 0;
-    bool use_fog = (rdp.other_mode_l >> 30) == G_BL_CLR_FOG;
-    bool texture_edge = (rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
-    bool use_noise = (rdp.other_mode_l & G_AC_DITHER) == G_AC_DITHER;
-    
+    const bool use_fog = configEnableFog && (rdp.other_mode_l >> 30) == G_BL_CLR_FOG;
+    const bool texture_edge = (rdp.other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
+    const bool use_noise = (rdp.other_mode_l & G_AC_DITHER) == G_AC_DITHER;
+
     if (texture_edge) {
         use_alpha = true;
     }
-    
+
     if (use_alpha) cc_id |= SHADER_OPT_ALPHA;
     if (use_fog) cc_id |= SHADER_OPT_FOG;
     if (texture_edge) cc_id |= SHADER_OPT_TEXTURE_EDGE;
     if (use_noise) cc_id |= SHADER_OPT_NOISE;
-    
+
     if (!use_alpha) {
         cc_id &= ~0xfff000;
     }
-    
+
     struct ColorCombiner *comb = gfx_lookup_or_create_color_combiner(cc_id);
     struct ShaderProgram *prg = comb->prg;
     if (prg != rendering_state.shader_program) {
@@ -832,10 +786,14 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
         gfx_rapi->set_use_alpha(use_alpha);
         rendering_state.alpha_blend = use_alpha;
     }
-    uint8_t num_inputs;
-    bool used_textures[2];
-    gfx_rapi->shader_get_info(prg, &num_inputs, used_textures);
-    
+
+    if (out_use_fog) *out_use_fog = use_fog;
+    if (out_use_alpha) *out_use_alpha = use_alpha;
+
+    return comb;
+}
+
+static inline bool gfx_update_textures(const bool used_textures[2], const bool linear_filter) {
     for (int i = 0; i < 2; i++) {
         if (used_textures[i]) {
             if (rdp.textures_changed[i]) {
@@ -843,7 +801,6 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
                 import_texture(i);
                 rdp.textures_changed[i] = false;
             }
-            bool linear_filter = (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
             if (linear_filter != rendering_state.textures[i]->linear_filter || rdp.texture_tile.cms != rendering_state.textures[i]->cms || rdp.texture_tile.cmt != rendering_state.textures[i]->cmt) {
                 gfx_flush();
                 gfx_rapi->set_sampler_parameters(i, linear_filter, rdp.texture_tile.cms, rdp.texture_tile.cmt);
@@ -853,14 +810,71 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
             }
         }
     }
-    
-    bool use_texture = used_textures[0] || used_textures[1];
-    uint32_t tex_width = (rdp.texture_tile.lrs - rdp.texture_tile.uls + 4) / 4;
-    uint32_t tex_height = (rdp.texture_tile.lrt - rdp.texture_tile.ult + 4) / 4;
-    
-    bool z_is_from_0_to_1 = gfx_rapi->z_is_from_0_to_1();
-    
+    return used_textures[0] || used_textures[1];
+}
+
+static inline void gfx_push_triangle(const struct LoadedVertex *restrict v1, const struct LoadedVertex *restrict v2, const struct LoadedVertex *restrict v3) {
+    const struct LoadedVertex *v_arr[3] = {v1, v2, v3};
+
+    const bool depth_test = (rsp.geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    if (depth_test != rendering_state.depth_test) {
+        gfx_flush();
+        gfx_rapi->set_depth_test(depth_test);
+        rendering_state.depth_test = depth_test;
+    }
+
+    const bool z_upd = (rdp.other_mode_l & Z_UPD) == Z_UPD;
+    if (z_upd != rendering_state.depth_mask) {
+        gfx_flush();
+        gfx_rapi->set_depth_mask(z_upd);
+        rendering_state.depth_mask = z_upd;
+    }
+
+    const bool zmode_decal = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+    if (zmode_decal != rendering_state.decal_mode) {
+        gfx_flush();
+        gfx_rapi->set_zmode_decal(zmode_decal);
+        rendering_state.decal_mode = zmode_decal;
+    }
+
+    if (rdp.viewport_or_scissor_changed) {
+        if (memcmp(&rdp.viewport, &rendering_state.viewport, sizeof(rdp.viewport)) != 0) {
+            gfx_flush();
+            gfx_rapi->set_viewport(rdp.viewport.x, rdp.viewport.y, rdp.viewport.width, rdp.viewport.height);
+            rendering_state.viewport = rdp.viewport;
+        }
+        if (memcmp(&rdp.scissor, &rendering_state.scissor, sizeof(rdp.scissor)) != 0) {
+            gfx_flush();
+            gfx_rapi->set_scissor(rdp.scissor.x, rdp.scissor.y, rdp.scissor.width, rdp.scissor.height);
+            rendering_state.scissor = rdp.scissor;
+        }
+        rdp.viewport_or_scissor_changed = false;
+    }
+
+    uint8_t num_inputs;
+    bool used_textures[2], use_fog, use_alpha;
+
+    struct ColorCombiner *comb = gfx_pick_combiner(&use_fog, &use_alpha);
+    gfx_rapi->shader_get_info(rendering_state.shader_program, &num_inputs, used_textures);
+
+    const bool linear_filter = configFiltering && (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    const bool use_texture = gfx_update_textures(used_textures, linear_filter);
+    const uint32_t tex_width = (rdp.texture_tile.lrs - rdp.texture_tile.uls + 4) / 4;
+    const uint32_t tex_height = (rdp.texture_tile.lrt - rdp.texture_tile.ult + 4) / 4;
+
+#ifndef GFX_W_PREMULT
+    const bool z_is_from_0_to_1 = gfx_rapi->z_is_from_0_to_1();
+#endif
+
     for (int i = 0; i < 3; i++) {
+#ifdef GFX_W_PREMULT
+        const float w = v_arr[i]->w;
+        const float w_inv = 1.f / w;
+        buf_vbo[buf_vbo_len++] = v_arr[i]->x * w_inv;
+        buf_vbo[buf_vbo_len++] = v_arr[i]->y * w_inv;
+        buf_vbo[buf_vbo_len++] = (v_arr[i]->z + w) * 0.5f * w_inv;
+        buf_vbo[buf_vbo_len++] = w_inv; // store inverted W right away to save softrast the trouble
+#else
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (z_is_from_0_to_1) {
             z = (z + w) / 2.0f;
@@ -869,7 +883,8 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
         buf_vbo[buf_vbo_len++] = v_arr[i]->y;
         buf_vbo[buf_vbo_len++] = z;
         buf_vbo[buf_vbo_len++] = w;
-        
+#endif
+
         if (use_texture) {
             float u = (v_arr[i]->u - rdp.texture_tile.uls * 8) / 32.0f;
             float v = (v_arr[i]->v - rdp.texture_tile.ult * 8) / 32.0f;
@@ -878,19 +893,21 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
                 u += 0.5f;
                 v += 0.5f;
             }
-            buf_vbo[buf_vbo_len++] = u / tex_width;
-            buf_vbo[buf_vbo_len++] = v / tex_height;
+            buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(u / tex_width);
+            buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(v / tex_height);
         }
-        
+
         if (use_fog) {
-            buf_vbo[buf_vbo_len++] = rdp.fog_color.r / 255.0f;
-            buf_vbo[buf_vbo_len++] = rdp.fog_color.g / 255.0f;
-            buf_vbo[buf_vbo_len++] = rdp.fog_color.b / 255.0f;
-            buf_vbo[buf_vbo_len++] = v_arr[i]->color.a / 255.0f; // fog factor (not alpha)
+#ifndef GFX_NO_FOG_COLOR
+            buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(rdp.fog_color.r));
+            buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(rdp.fog_color.g));
+            buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(rdp.fog_color.b));
+#endif
+            buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(v_arr[i]->color.a)); // fog factor (not alpha)
         }
-        
+
         for (int j = 0; j < num_inputs; j++) {
-            struct RGBA *color;
+            const struct RGBA *color;
             struct RGBA tmp;
             for (int k = 0; k < 1 + (use_alpha ? 1 : 0); k++) {
                 switch (comb->shader_input_mapping[k][j]) {
@@ -918,15 +935,15 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
                         break;
                 }
                 if (k == 0) {
-                    buf_vbo[buf_vbo_len++] = color->r / 255.0f;
-                    buf_vbo[buf_vbo_len++] = color->g / 255.0f;
-                    buf_vbo[buf_vbo_len++] = color->b / 255.0f;
+                    buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(color->r));
+                    buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(color->g));
+                    buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(color->b));
                 } else {
                     if (use_fog && color == &v_arr[i]->color) {
                         // Shade alpha is 100% for fog
-                        buf_vbo[buf_vbo_len++] = 1.0f;
+                        buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_ONE);
                     } else {
-                        buf_vbo[buf_vbo_len++] = color->a / 255.0f;
+                        buf_vbo[buf_vbo_len++] = GFX_OUT_PROP(GFX_COLOR_CONVERT(color->a));
                     }
                 }
             }
@@ -942,6 +959,147 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     }
 }
 
+#ifdef GFX_MANUAL_CLIPPING
+static inline float flerp(const float v0, const float v1, const float t) {
+    return v0 + t * (v1 - v0);
+}
+
+static inline struct RGBA rgba_lerp(const struct RGBA c0, const struct RGBA c1, const float t) {
+    return (struct RGBA){
+        c0.r + (c1.r - c0.r) * t,
+        c0.g + (c1.g - c0.g) * t,
+        c0.b + (c1.b - c0.b) * t,
+        c0.a + (c0.a - c0.a) * t,
+    };
+}
+
+static inline bool gfx_clip_triangle(struct LoadedVertex *v1, struct LoadedVertex *v2, struct LoadedVertex *v3, const uint8_t clip_and) {
+    static const float c_planes[][4] = {
+        {  0.0f,  0.0f, -1.0f,  1.0f }, // near
+        {  0.0f,  0.0f,  1.0f,  1.0f }, // far
+        {  0.0f, -1.0f,  0.0f,  1.0f }, // top
+        {  0.0f,  1.0f,  0.0f,  1.0f }, // bottom
+        { -1.0f,  0.0f,  0.0f,  1.0f }, // left
+        {  1.0f,  0.0f,  0.0f,  1.0f }, // right
+    };
+
+    const uint8_t clip_or = v1->clip_rej | v2->clip_rej | v3->clip_rej;
+
+    if (!clip_or && clip_and) return false; // triangle fully in frustum
+
+    struct LoadedVertex v_buf[2][12] = { { *v1, *v2, *v3 } };
+    int v_num[2] = { 3, 0 };
+    int v_idx = 0;
+
+    uint8_t plane_idx = 0;
+    for (uint8_t clip_mask = 1; clip_mask < 64; clip_mask <<= 1, ++plane_idx) {
+        if (!(clip_or & clip_mask)) continue;
+
+        const int num_verts = v_num[v_idx];
+        const int outidx = !v_idx;
+        const struct LoadedVertex *v_in = v_buf[v_idx];
+        struct LoadedVertex *v_out = v_buf[outidx];
+        const float *plane = c_planes[plane_idx];
+
+        for (int i = 0; i < num_verts; ++i) {
+            const struct LoadedVertex *vthis = &v_in[i];
+            const struct LoadedVertex *vnext = &v_in[(i + 1) % num_verts];
+            const float d1 = plane[0] * vthis->x + plane[1] * vthis->y + plane[2] * vthis->z + vthis->w;
+            const float d2 = plane[0] * vnext->x + plane[1] * vnext->y + plane[2] * vnext->z + vnext->w;
+            const bool this_in = d1 > 0.0f;
+            const bool next_in = d2 > 0.0f;
+            // current is inside clipping plane, push it into output
+            if (this_in) v_out[v_num[outidx]++] = *vthis;
+            // one of the vertices is outside, clip the edge and push intersection
+            if (this_in ^ next_in) {
+                struct LoadedVertex *xv = &v_out[v_num[outidx]++];
+                if (this_in) {
+                    const float t = d1 / (d1 - d2);
+                    xv->x = flerp(vthis->x, vnext->x, t);
+                    xv->y = flerp(vthis->y, vnext->y, t);
+                    xv->z = flerp(vthis->z, vnext->z, t);
+                    xv->w = flerp(vthis->w, vnext->w, t);
+                    xv->u = flerp(vthis->u, vnext->u, t);
+                    xv->v = flerp(vthis->v, vnext->v, t);
+                    xv->color = rgba_lerp(vthis->color, vnext->color, t);
+                    xv->clip_rej = 0;
+                } else {
+                    const float t = d2 / (d2 - d1);
+                    xv->x = flerp(vnext->x, vthis->x, t);
+                    xv->y = flerp(vnext->y, vthis->y, t);
+                    xv->z = flerp(vnext->z, vthis->z, t);
+                    xv->w = flerp(vnext->w, vthis->w, t);
+                    xv->u = flerp(vnext->u, vthis->u, t);
+                    xv->v = flerp(vnext->v, vthis->v, t);
+                    xv->color = rgba_lerp(vnext->color, vthis->color, t);
+                }
+            }
+        }
+
+        if (v_num[outidx] < 3) return true; // not enough for a triangle
+
+        v_idx = outidx;
+        v_num[!v_idx] = 0;
+    }
+
+    // make a triangle fan
+    const int n = v_num[v_idx] - 1;
+    const struct LoadedVertex *in = v_buf[v_idx];
+    for (int i = 1; i < n; ++i)
+        gfx_push_triangle(in + 0, in + i, in + i + 1);
+
+    return true;
+}
+#endif
+
+static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
+    struct LoadedVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
+    struct LoadedVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
+    struct LoadedVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
+
+    //if (rand()%2) return;
+
+    const uint8_t clip_and = v1->clip_rej & v2->clip_rej & v3->clip_rej;
+    if (clip_and) {
+        // The whole triangle lies outside the visible area
+        return;
+    }
+
+    if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
+        float dx1 = v1->x / (v1->w) - v2->x / (v2->w);
+        float dy1 = v1->y / (v1->w) - v2->y / (v2->w);
+        float dx2 = v3->x / (v3->w) - v2->x / (v2->w);
+        float dy2 = v3->y / (v3->w) - v2->y / (v2->w);
+        float cross = dx1 * dy2 - dy1 * dx2;
+
+        if ((v1->w < 0) ^ (v2->w < 0) ^ (v3->w < 0)) {
+            // If one vertex lies behind the eye, negating cross will give the correct result.
+            // If all vertices lie behind the eye, the triangle will be rejected anyway.
+            cross = -cross;
+        }
+
+        switch (rsp.geometry_mode & G_CULL_BOTH) {
+            case G_CULL_FRONT:
+                if (cross <= 0) return;
+                break;
+            case G_CULL_BACK:
+                if (cross >= 0) return;
+                break;
+            case G_CULL_BOTH:
+                // Why is this even an option?
+                return;
+        }
+    }
+
+#ifdef GFX_MANUAL_CLIPPING
+    // clip the triangle and put the resulting triangles into the buffer
+    // otherwise put the current triangle
+    if (!gfx_clip_triangle(v1, v2, v3, clip_and))
+#endif
+
+    gfx_push_triangle(v1, v2, v3);
+}
+
 static void gfx_sp_geometry_mode(uint32_t clear, uint32_t set) {
     rsp.geometry_mode &= ~clear;
     rsp.geometry_mode |= set;
@@ -953,17 +1111,17 @@ static void gfx_calc_and_set_viewport(const Vp_t *viewport) {
     float height = 2.0f * viewport->vscale[1] / 4.0f;
     float x = (viewport->vtrans[0] / 4.0f) - width / 2.0f;
     float y = SCREEN_HEIGHT - ((viewport->vtrans[1] / 4.0f) + height / 2.0f);
-    
-    width *= RATIO_X;
-    height *= RATIO_Y;
-    x *= RATIO_X;
-    y *= RATIO_Y;
-    
+
+    width *= ratio_x;
+    height *= ratio_y;
+    x *= ratio_x;
+    y *= ratio_y;
+
     rdp.viewport.x = x;
     rdp.viewport.y = y;
     rdp.viewport.width = width;
     rdp.viewport.height = height;
-    
+
     rdp.viewport_or_scissor_changed = true;
 }
 
@@ -1024,16 +1182,16 @@ static void gfx_sp_texture(uint16_t sc, uint16_t tc, uint8_t level, uint8_t tile
 }
 
 static void gfx_dp_set_scissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry) {
-    float x = ulx / 4.0f * RATIO_X;
-    float y = (SCREEN_HEIGHT - lry / 4.0f) * RATIO_Y;
-    float width = (lrx - ulx) / 4.0f * RATIO_X;
-    float height = (lry - uly) / 4.0f * RATIO_Y;
-    
+    float x = ulx / 4.0f * ratio_x;
+    float y = (SCREEN_HEIGHT - lry / 4.0f) * ratio_y;
+    float width = (lrx - ulx) / 4.0f * ratio_x;
+    float height = (lry - uly) / 4.0f * ratio_y;
+
     rdp.scissor.x = x;
     rdp.scissor.y = y;
     rdp.scissor.width = width;
     rdp.scissor.height = height;
-    
+
     rdp.viewport_or_scissor_changed = true;
 }
 
@@ -1053,7 +1211,7 @@ static void gfx_dp_set_tile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_t t
         rdp.textures_changed[0] = true;
         rdp.textures_changed[1] = true;
     }
-    
+
     if (tile == G_TX_LOADTILE) {
         rdp.texture_to_load.tile_number = tmem / 256;
     }
@@ -1081,7 +1239,7 @@ static void gfx_dp_load_block(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
     SUPPORT_CHECK(uls == 0);
     SUPPORT_CHECK(ult == 0);
-    
+
     // The lrs field rather seems to be number of pixels to load
     uint32_t word_size_shift;
     switch (rdp.texture_to_load.siz) {
@@ -1102,7 +1260,7 @@ static void gfx_dp_load_block(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t
     rdp.loaded_texture[rdp.texture_to_load.tile_number].size_bytes = size_bytes;
     assert(size_bytes <= 4096 && "bug: too big texture");
     rdp.loaded_texture[rdp.texture_to_load.tile_number].addr = rdp.texture_to_load.addr;
-    
+
     rdp.textures_changed[rdp.texture_to_load.tile_number] = true;
 }
 
@@ -1193,6 +1351,7 @@ static void gfx_dp_set_fog_color(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     rdp.fog_color.g = g;
     rdp.fog_color.b = b;
     rdp.fog_color.a = a;
+    if (gfx_rapi->set_fog_color) gfx_rapi->set_fog_color(&rdp.fog_color.r);
 }
 
 static void gfx_dp_set_fill_color(uint32_t packed_color) {
@@ -1210,66 +1369,65 @@ static void gfx_dp_set_fill_color(uint32_t packed_color) {
 static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
     uint32_t saved_other_mode_h = rdp.other_mode_h;
     uint32_t cycle_type = (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE));
-    
+
     if (cycle_type == G_CYC_COPY) {
         rdp.other_mode_h = (rdp.other_mode_h & ~(3U << G_MDSFT_TEXTFILT)) | G_TF_POINT;
     }
-    
+
     // U10.2 coordinates
     float ulxf = ulx;
     float ulyf = uly;
     float lrxf = lrx;
     float lryf = lry;
-    
+
     ulxf = ulxf / (4.0f * HALF_SCREEN_WIDTH) - 1.0f;
     ulyf = -(ulyf / (4.0f * HALF_SCREEN_HEIGHT)) + 1.0f;
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT)) + 1.0f;
-    
     ulxf = gfx_adjust_x_for_aspect_ratio(ulxf);
     lrxf = gfx_adjust_x_for_aspect_ratio(lrxf);
-    
+
     struct LoadedVertex* ul = &rsp.loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &rsp.loaded_vertices[MAX_VERTICES + 1];
     struct LoadedVertex* lr = &rsp.loaded_vertices[MAX_VERTICES + 2];
     struct LoadedVertex* ur = &rsp.loaded_vertices[MAX_VERTICES + 3];
-    
+
     ul->x = ulxf;
     ul->y = ulyf;
     ul->z = -1.0f;
     ul->w = 1.0f;
-    
+
     ll->x = ulxf;
     ll->y = lryf;
     ll->z = -1.0f;
     ll->w = 1.0f;
-    
+
     lr->x = lrxf;
     lr->y = lryf;
     lr->z = -1.0f;
     lr->w = 1.0f;
-    
+
     ur->x = lrxf;
     ur->y = ulyf;
     ur->z = -1.0f;
     ur->w = 1.0f;
-    
+
     // The coordinates for texture rectangle shall bypass the viewport setting
     struct XYWidthHeight default_viewport = {0, 0, gfx_current_dimensions.width, gfx_current_dimensions.height};
     struct XYWidthHeight viewport_saved = rdp.viewport;
     uint32_t geometry_mode_saved = rsp.geometry_mode;
-    
+
     rdp.viewport = default_viewport;
     rdp.viewport_or_scissor_changed = true;
     rsp.geometry_mode = 0;
-    
+
     gfx_sp_tri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 3);
     gfx_sp_tri1(MAX_VERTICES + 1, MAX_VERTICES + 2, MAX_VERTICES + 3);
-    
+
     rsp.geometry_mode = geometry_mode_saved;
     rdp.viewport = viewport_saved;
     rdp.viewport_or_scissor_changed = true;
-    
+
     if (cycle_type == G_CYC_COPY) {
         rdp.other_mode_h = saved_other_mode_h;
     }
@@ -1281,15 +1439,15 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         // Per RDP Command Summary Set Tile's shift s and this dsdx should be set to 4 texels
         // Divide by 4 to get 1 instead
         dsdx >>= 2;
-        
+
         // Color combiner is turned off in copy mode
         gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), color_comb(0, 0, 0, G_ACMUX_TEXEL0));
-        
+
         // Per documentation one extra pixel is added in this modes to each edge
         lrx += 1 << 2;
         lry += 1 << 2;
     }
-    
+
     // uls and ult are S10.5
     // dsdx and dtdy are S5.10
     // lrx, lry, ulx, uly are U10.2
@@ -1302,28 +1460,45 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
     int16_t height = !flip ? lry - uly : lrx - ulx;
     float lrs = ((uls << 7) + dsdx * width) >> 7;
     float lrt = ((ult << 7) + dtdy * height) >> 7;
-    
-    struct LoadedVertex* ul = &rsp.loaded_vertices[MAX_VERTICES + 0];
-    struct LoadedVertex* ll = &rsp.loaded_vertices[MAX_VERTICES + 1];
-    struct LoadedVertex* lr = &rsp.loaded_vertices[MAX_VERTICES + 2];
-    struct LoadedVertex* ur = &rsp.loaded_vertices[MAX_VERTICES + 3];
-    ul->u = uls;
-    ul->v = ult;
-    lr->u = lrs;
-    lr->v = lrt;
-    if (!flip) {
-        ll->u = uls;
-        ll->v = lrt;
-        ur->u = lrs;
-        ur->v = ult;
+
+    if (gfx_rapi->tex_rect) {
+        float ulxf = ulx * ratio_x;
+        float ulyf = uly * ratio_y;
+        float lrxf = lrx * ratio_x;
+        float lryf = lry * ratio_y;
+        const float dudx = ((lrs - (float)uls) / (lrxf - ulxf));
+        const float dvdy = ((lrt - (float)ult) / (lryf - ulyf));
+        const bool used_textures[2] = { true, false };
+        gfx_pick_combiner(NULL, NULL);
+        gfx_update_textures(used_textures, false);
+        ulxf = HALF_SCREEN_WIDTH + gfx_adjust_x_for_aspect_ratio(ulxf / 4.0f - HALF_SCREEN_WIDTH);
+        lrxf = HALF_SCREEN_WIDTH + gfx_adjust_x_for_aspect_ratio(lrxf / 4.0f - HALF_SCREEN_WIDTH);
+        ulyf = ulyf / 4.0f;
+        lryf = lryf / 4.0f;
+        gfx_rapi->tex_rect(ulxf, ulyf, lrxf, lryf, uls / 32.f, ult / 32.f, dudx / 8.f, dvdy / 8.f, &rdp.env_color.r);
     } else {
-        ll->u = lrs;
-        ll->v = ult;
-        ur->u = uls;
-        ur->v = lrt;
+        struct LoadedVertex* ul = &rsp.loaded_vertices[MAX_VERTICES + 0];
+        struct LoadedVertex* ll = &rsp.loaded_vertices[MAX_VERTICES + 1];
+        struct LoadedVertex* lr = &rsp.loaded_vertices[MAX_VERTICES + 2];
+        struct LoadedVertex* ur = &rsp.loaded_vertices[MAX_VERTICES + 3];
+        ul->u = uls;
+        ul->v = ult;
+        lr->u = lrs;
+        lr->v = lrt;
+        if (!flip) {
+            ll->u = uls;
+            ll->v = lrt;
+            ur->u = lrs;
+            ur->v = ult;
+        } else {
+            ll->u = lrs;
+            ll->v = ult;
+            ur->u = uls;
+            ur->v = lrt;
+        }
+        gfx_draw_rectangle(ulx, uly, lrx, lry);
     }
-    
-    gfx_draw_rectangle(ulx, uly, lrx, lry);
+
     rdp.combine_mode = saved_combine_mode;
 }
 
@@ -1333,21 +1508,35 @@ static void gfx_dp_fill_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t
         return;
     }
     uint32_t mode = (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE));
-    
+
     if (mode == G_CYC_COPY || mode == G_CYC_FILL) {
         // Per documentation one extra pixel is added in this modes to each edge
         lrx += 1 << 2;
         lry += 1 << 2;
     }
-    
-    for (int i = MAX_VERTICES; i < MAX_VERTICES + 4; i++) {
-        struct LoadedVertex* v = &rsp.loaded_vertices[i];
-        v->color = rdp.fill_color;
-    }
-    
-    uint32_t saved_combine_mode = rdp.combine_mode;
+
+    const uint32_t saved_combine_mode = rdp.combine_mode;
     gfx_dp_set_combine_mode(color_comb(0, 0, 0, G_CCMUX_SHADE), color_comb(0, 0, 0, G_ACMUX_SHADE));
-    gfx_draw_rectangle(ulx, uly, lrx, lry);
+
+    if (gfx_rapi->fill_rect) {
+        float ulxf = ulx * ratio_x;
+        float ulyf = uly * ratio_y;
+        float lrxf = lrx * ratio_x;
+        float lryf = lry * ratio_y;
+        gfx_pick_combiner(NULL, NULL);
+        ulxf = HALF_SCREEN_WIDTH + gfx_adjust_x_for_aspect_ratio(ulxf / 4.0f - HALF_SCREEN_WIDTH);
+        lrxf = HALF_SCREEN_WIDTH + gfx_adjust_x_for_aspect_ratio(lrxf / 4.0f - HALF_SCREEN_WIDTH);
+        ulyf = ulyf / 4.0f;
+        lryf = lryf / 4.0f;
+        gfx_rapi->fill_rect(ulxf, ulyf, lrxf, lryf, &rdp.fill_color.r);
+    } else {
+        for (int i = MAX_VERTICES; i < MAX_VERTICES + 4; i++) {
+            struct LoadedVertex* v = &rsp.loaded_vertices[i];
+            v->color = rdp.fill_color;
+        }
+        gfx_draw_rectangle(ulx, uly, lrx, lry);
+    }
+
     rdp.combine_mode = saved_combine_mode;
 }
 
@@ -1625,8 +1814,9 @@ void gfx_init(struct GfxWindowManagerAPI *wapi, struct GfxRenderingAPI *rapi, co
     gfx_wapi = wapi;
     gfx_rapi = rapi;
     gfx_wapi->init(game_name, start_in_fullscreen);
+    gfx_wapi->get_dimensions(&gfx_current_dimensions.width, &gfx_current_dimensions.height);
     gfx_rapi->init();
-    
+
     // Used in the 120 star TAS
     static uint32_t precomp_shaders[] = {
         0x01200200,
@@ -1661,6 +1851,13 @@ void gfx_init(struct GfxWindowManagerAPI *wapi, struct GfxRenderingAPI *rapi, co
     }
 }
 
+void gfx_shutdown(void) {
+    if (gfx_rapi && gfx_rapi->shutdown) gfx_rapi->shutdown();
+    if (gfx_wapi && gfx_wapi->shutdown) gfx_wapi->shutdown();
+    gfx_rapi = NULL;
+    gfx_wapi = NULL;
+}
+
 struct GfxRenderingAPI *gfx_get_current_rendering_api(void) {
     return gfx_rapi;
 }
@@ -1672,26 +1869,27 @@ void gfx_start_frame(void) {
         // Avoid division by zero
         gfx_current_dimensions.height = 1;
     }
+    ratio_x = (float)gfx_current_dimensions.width / (float)SCREEN_WIDTH;
+    ratio_y = (float)gfx_current_dimensions.height / (float)SCREEN_HEIGHT;
+    inv_ratio_x = (float)SCREEN_WIDTH / (float)gfx_current_dimensions.width;
+    inv_ratio_y = (float)SCREEN_HEIGHT / (float)gfx_current_dimensions.height;
     gfx_current_dimensions.aspect_ratio = (float)gfx_current_dimensions.width / (float)gfx_current_dimensions.height;
 }
 
 void gfx_run(Gfx *commands) {
     gfx_sp_reset();
-    
+
     //puts("New frame");
-    
+
     if (!gfx_wapi->start_frame()) {
         dropped_frame = true;
         return;
     }
     dropped_frame = false;
-    
-    double t0 = gfx_wapi->get_time();
+
     gfx_rapi->start_frame();
     gfx_run_dl(commands);
     gfx_flush();
-    double t1 = gfx_wapi->get_time();
-    //printf("Process %f %f\n", t1, t1 - t0);
     gfx_rapi->end_frame();
     gfx_wapi->swap_buffers_begin();
 }

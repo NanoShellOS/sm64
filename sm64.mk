@@ -181,7 +181,8 @@ endif
 
 # OPT_FLAGS - for ports
 ifeq ($(TARGET_N64),0)
-  OPT_FLAGS := -O2
+  OPT_FLAGS := -g
+  # -O2
   ifeq ($(TARGET_WEB),1)
     OPT_FLAGS += -g4 --source-map-base http://localhost:8080/
   endif
@@ -605,7 +606,7 @@ ifeq ($(TARGET_WEB),1)
   PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
 endif
 ifeq ($(TARGET_NANOSHELL),1)
-  PLATFORM_CFLAGS  := -DTARGET_NANOSHELL
+  PLATFORM_CFLAGS  := -DTARGET_NANOSHELL -DENABLE_SOFTRAST
   PLATFORM_LDFLAGS := $(NANOSHELL_LDFLAGS) -T sm64-nanoshell.ld -g -nostdlib -zmax-page-size=0x1000
 endif
 

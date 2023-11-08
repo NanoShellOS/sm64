@@ -1,5 +1,4 @@
 #include <stdlib.h>
-
 #ifdef TARGET_WEB
 #include <emscripten.h>
 #include <emscripten/html5.h>
@@ -12,15 +11,17 @@
 
 #include "gfx/gfx_pc.h"
 #include "gfx/gfx_opengl.h"
+#include "gfx/gfx_soft.h"
 #include "gfx/gfx_direct3d11.h"
 #include "gfx/gfx_direct3d12.h"
+#include "gfx/gfx_dos_api.h"
+#include "gfx/gfx_nanoshell_api.h"
 #include "gfx/gfx_dxgi.h"
 #include "gfx/gfx_glx.h"
 #include "gfx/gfx_sdl.h"
-#include "gfx/gfx_nanoshell.h"
-#include "gfx/gfx_dummy.h"
 
 #include "audio/audio_api.h"
+#include "audio/audio_sb16.h"
 #include "audio/audio_wasapi.h"
 #include "audio/audio_pulse.h"
 #include "audio/audio_alsa.h"
@@ -82,21 +83,17 @@ void exec_display_list(struct SPTask *spTask) {
 void produce_one_frame(void) {
     gfx_start_frame();
     game_loop_one_iteration();
-    
-    int samples_left = audio_api->buffered();
-    u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? SAMPLES_HIGH : SAMPLES_LOW;
-    //printf("Audio samples: %d %u\n", samples_left, num_audio_samples);
-    s16 audio_buffer[SAMPLES_HIGH * 2 * 2];
-    for (int i = 0; i < 2; i++) {
-        /*if (audio_cnt-- == 0) {
-            audio_cnt = 2;
+
+    if (configEnableSound) {
+        int samples_left = audio_api->buffered();
+        u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+        s16 audio_buffer[SAMPLES_HIGH * 2 * 2];
+        for (int i = 0; i < 2; i++) {
+            create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
         }
-        u32 num_audio_samples = audio_cnt < 2 ? 528 : 544;*/
-        create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
+        audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
     }
-    //printf("Audio samples before submitting: %d\n", audio_api->buffered());
-    audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
-    
+
     gfx_end_frame();
 }
 
@@ -141,6 +138,12 @@ static void on_fullscreen_changed(bool is_now_fullscreen) {
     configFullscreen = is_now_fullscreen;
 }
 
+void game_exit(void) {
+    if (audio_api && audio_api->shutdown) audio_api->shutdown();
+    gfx_shutdown();
+    exit(0);
+}
+
 void main_func(void) {
 #ifdef USE_SYSTEM_MALLOC
     main_pool_init();
@@ -150,7 +153,7 @@ void main_func(void) {
     main_pool_init(pool, pool + sizeof(pool) / sizeof(pool[0]));
 #endif
     gEffectsMemoryPool = mem_pool_init(0x4000, MEMORY_POOL_LEFT);
-
+	
     configfile_load(CONFIG_FILE);
     atexit(save_config);
 
@@ -165,49 +168,64 @@ void main_func(void) {
 #elif defined(ENABLE_DX11)
     rendering_api = &gfx_direct3d11_api;
     wm_api = &gfx_dxgi_api;
-#elif defined(ENABLE_OPENGL)
+#elif defined(ENABLE_OPENGL) || defined(ENABLE_OPENGL_LEGACY)
     rendering_api = &gfx_opengl_api;
     #if defined(__linux__) || defined(__BSD__)
         wm_api = &gfx_glx;
+    #elif defined(TARGET_DOS)
+        wm_api = &gfx_dos_api;
     #else
         wm_api = &gfx_sdl;
     #endif
-#elif defined(ENABLE_WM_NANOSHELL)
-    rendering_api = &gfx_nanoshell_renderer_api;
-	wm_api = &gfx_nanoshell_wm_api;
-#elif defined(ENABLE_GFX_DUMMY)
-    rendering_api = &gfx_dummy_renderer_api;
-    wm_api = &gfx_dummy_wm_api;
+#elif defined(ENABLE_SOFTRAST)
+    rendering_api = &gfx_soft_api;
+    #if defined(TARGET_DOS)
+        wm_api = &gfx_dos_api;
+    #elif defined(TARGET_NANOSHELL)
+        wm_api = &gfx_nanoshell_api;
+    #else
+        wm_api = &gfx_sdl;
+    #endif
+#else
+    #error Could not pick rendering API!
 #endif
 
     gfx_init(wm_api, rendering_api, "Super Mario 64 PC-Port", configFullscreen);
-    
-    wm_api->set_fullscreen_changed_callback(on_fullscreen_changed);
-    wm_api->set_keyboard_callbacks(keyboard_on_key_down, keyboard_on_key_up, keyboard_on_all_keys_up);
-    
+
+    if (configEnableSound) {
 #if HAVE_WASAPI
-    if (audio_api == NULL && audio_wasapi.init()) {
-        audio_api = &audio_wasapi;
-    }
+        if (audio_api == NULL && audio_wasapi.init()) {
+            audio_api = &audio_wasapi;
+        }
 #endif
 #if HAVE_PULSE_AUDIO
-    if (audio_api == NULL && audio_pulse.init()) {
-        audio_api = &audio_pulse;
-    }
+        if (audio_api == NULL && audio_pulse.init()) {
+            audio_api = &audio_pulse;
+        }
 #endif
 #if HAVE_ALSA
-    if (audio_api == NULL && audio_alsa.init()) {
-        audio_api = &audio_alsa;
-    }
+        if (audio_api == NULL && audio_alsa.init()) {
+            audio_api = &audio_alsa;
+        }
 #endif
 #ifdef TARGET_WEB
-    if (audio_api == NULL && audio_sdl.init()) {
-        audio_api = &audio_sdl;
-    }
+        if (audio_api == NULL && audio_sdl.init()) {
+            audio_api = &audio_sdl;
+        }
 #endif
+#ifdef TARGET_DOS
+        if (audio_api == NULL && audio_sb.init()) {
+            audio_api = &audio_sb;
+        }
+#endif
+    }
+
     if (audio_api == NULL) {
         audio_api = &audio_null;
     }
+
+    wm_api->set_fullscreen_changed_callback(on_fullscreen_changed);
+    wm_api->set_keyboard_callbacks(keyboard_on_key_down, keyboard_on_key_up, keyboard_on_all_keys_up);
 
     audio_init();
     sound_init();
