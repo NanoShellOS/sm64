@@ -6,6 +6,7 @@
 #include "controller_recorded_tas.h"
 #include "controller_keyboard.h"
 #include "controller_dos_keyboard.h"
+#include "controller_nanoshell_keyboard.h"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include "controller_xinput.h"
@@ -24,7 +25,7 @@ static struct ControllerAPI *controller_implementations[] = {
 #elif defined(TARGET_DOS)
     &controller_dos_keyboard,
 #elif defined(TARGET_NANOSHELL)
-    // @TODO: &controller_nanoshell_keyboard,
+    &controller_nanoshell_keyboard,
 #else
     &controller_sdl,
 #endif

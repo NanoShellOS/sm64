@@ -252,6 +252,30 @@ int WINAPI WinMain(UNUSED HINSTANCE hInstance, UNUSED HINSTANCE hPrevInstance, U
 }
 #else
 int main(UNUSED int argc, UNUSED char *argv[]) {
+#ifdef TARGET_NANOSHELL
+	extern int rez_divider;
+	
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--help") == 0 ||
+		    strcmp(argv[i], "/?") == 0)
+		{
+			(void) printf("By default, /q resolution mode is used.");
+			(void) printf("/f - use full resolution 640x480");
+			(void) printf("/h - use original resolution 320x240");
+			(void) printf("/q - use half resolution 160x120");
+		}
+		
+		if (strcmp(argv[i], "/f") == 0)
+			rez_divider = 1;
+		
+		if (strcmp(argv[i], "/h") == 0)
+			rez_divider = 2;
+		
+		if (strcmp(argv[i], "/q") == 0)
+			rez_divider = 4;
+	}
+#endif
+	
     main_func();
     return 0;
 }

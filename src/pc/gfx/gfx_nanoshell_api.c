@@ -11,6 +11,8 @@
 
 #include <nanoshell/nanoshell.h>
 
+#include "../controller/controller_nanoshell_keyboard.h"
+
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -24,8 +26,11 @@
 #define PAL_LOAD            0x3C8     /* start loading palette */
 #define PAL_COLOR           0x3C9     /* load next palette color */
 
-#define SCREEN_WIDTH        320       /* width in pixels */
-#define SCREEN_HEIGHT       240       /* height in mode 13h, in pixels */
+int srw, srh;
+int rez_divider = 2;
+
+#define SCREEN_WIDTH        srw       /* width in pixels */
+#define SCREEN_HEIGHT       srh       /* height in mode 13h, in pixels */
 #define SCREEN_HEIGHT_X     240       /* height in mode X, in pixels */
 
 #define WINDOW_WIDTH        640
@@ -118,6 +123,12 @@ static void gfx_nanoshell_window_procedure(Window* window, int msg, int parm1, i
 			game_run_one_game_iter();
 			break;
 		}
+		case EVENT_KEYRAW:
+		{
+			int keycode = (int)(uint8_t)parm1;
+			keyboard_nanoshell_feed(keycode);
+			break;
+		}
 		default:
 		{
 			DefaultWindowProc(window, msg, parm1, parm2);
@@ -165,7 +176,7 @@ static void gfx_nanoshell_shutdown_impl(void) {
 	
 	DestroyWindow(game_window);
 	while (HandleMessages(game_window));
-	game_window = NULL;
+	game_exit();
 }
 
 static inline void gfx_nanoshell_swap_buffers_mode13(void) {
@@ -189,6 +200,10 @@ static inline void gfx_nanoshell_swap_buffers_mode13(void) {
 }
 
 static void gfx_nanoshell_init(UNUSED const char *game_name, UNUSED bool start_in_fullscreen) {
+	
+	srw = 640 / rez_divider;
+	srh = 480 / rez_divider;
+	
 	game_window = CreateWindow (
 		game_name,
 		GetScreenSizeX() / 2 - WINDOW_WIDTH / 2,
@@ -234,16 +249,12 @@ static void gfx_nanoshell_update_tick_count() {
 }
 
 static void gfx_nanoshell_main_loop(void (*run_one_game_iter)(void)) {
-	if (!game_window) {
-		LogMsg("left running without a window??");
-		return;
-	}
-	
 	game_run_one_game_iter = run_one_game_iter;
 	
 	while (HandleMessages(game_window));
 	
 	game_window = NULL;
+	game_exit();
 }
 
 static void gfx_nanoshell_get_dimensions(uint32_t *width, uint32_t *height) {
