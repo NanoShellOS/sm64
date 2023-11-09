@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #ifdef TARGET_WEB
 #include <emscripten.h>
 #include <emscripten/html5.h>
@@ -22,6 +23,7 @@
 
 #include "audio/audio_api.h"
 #include "audio/audio_sb16.h"
+#include "audio/audio_nanoshell.h"
 #include "audio/audio_wasapi.h"
 #include "audio/audio_pulse.h"
 #include "audio/audio_alsa.h"
@@ -85,8 +87,8 @@ void produce_one_frame(void) {
     game_loop_one_iteration();
 
     if (configEnableSound) {
-        int samples_left = audio_api->buffered();
-        u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+        //int samples_left = audio_api->buffered();
+        u32 num_audio_samples = SAMPLES_HIGH; //samples_left < audio_api->get_desired_buffered() ? SAMPLES_HIGH : SAMPLES_LOW;
         s16 audio_buffer[SAMPLES_HIGH * 2 * 2];
         for (int i = 0; i < 2; i++) {
             create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
@@ -217,6 +219,13 @@ void main_func(void) {
         if (audio_api == NULL && audio_sb.init()) {
             audio_api = &audio_sb;
         }
+#endif
+#ifdef TARGET_NANOSHELL
+        /*
+		if (audio_api == NULL && audio_nanoshell.init()) {
+            audio_api = &audio_nanoshell;
+        }
+		*/
 #endif
     }
 

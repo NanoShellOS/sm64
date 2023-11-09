@@ -525,7 +525,6 @@ else ifeq ($(TARGET_NANOSHELL),1)
   -mno-kl                 \
   -mno-lwp                \
   -mno-lzcnt              \
-  -mno-mmx                \
   -mno-movbe              \
   -mno-movdir64b          \
   -mno-movdiri            \
@@ -547,7 +546,6 @@ else ifeq ($(TARGET_NANOSHELL),1)
   -mno-sgx                \
   -mno-sha                \
   -mno-shstk              \
-  -mno-sse                \
   -mno-sse2               \
   -mno-sse3               \
   -mno-sse4.1             \

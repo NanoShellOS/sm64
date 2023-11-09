@@ -6,4 +6,5 @@ float sqrtf(float f);
 float sinf(float f);
 float cosf(float f);
 float floorf(float f);
+float ceilf(float f);
 float fabsf(float f);

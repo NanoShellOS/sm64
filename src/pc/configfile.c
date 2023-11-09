@@ -32,7 +32,7 @@ struct ConfigOption {
 bool configFullscreen            = false;
 bool configDrawSky               = true;
 bool configFiltering             = true;
-bool configEnableSound           = false;
+bool configEnableSound           = true;//false;
 bool configEnableFog             = true;
 unsigned int configScreenWidth   = 640;
 unsigned int configScreenHeight  = 480;
