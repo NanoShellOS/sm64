@@ -1,4 +1,4 @@
-# Super Mario 64 Port
+# Super Mario 64 Port (NanoShell)
 
 - This repo contains a full decompilation of Super Mario 64 (J), (U), (E), and (SH).
 - Naming and documentation of the source code and data structures are in progress.
@@ -8,6 +8,20 @@ This repo does not include all assets necessary for compiling the game.
 A prior copy of the game is required to extract the assets.
 
 ## Building native executables
+
+### NanoShell
+
+**NOTE:** You MUST check it out in `<NanoShell root folder>/apps/sm64`! Otherwise, this won't be able to find NanoShell specific includes.
+
+1. Install prerequisites (Ubuntu): `sudo apt install -y git build-essential pkg-config libusb-1.0-0-dev libsdl2-dev`.
+2. Clone the repo: `git clone https://github.com/sm64-port/sm64-port.git`, which will create a directory `sm64-port` and then **enter** it `cd sm64-port`.
+3. Place a Super Mario 64 ROM called `baserom.<VERSION>.z64` into the repository's root directory for asset extraction, where `VERSION` can be `us`, `jp`, or `eu`.
+4. Run `make` to build. Qualify the version through `make VERSION=<VERSION>`. Add `-j4` to improve build speed (hardware dependent based on the amount of CPU cores available).
+5. The executable binary will be located at `build/<VERSION>_pc/sm64.<VERSION>.nse` or `sm64.nse`.
+
+Additionally, since this integrates well into the NanoShell build system, you can just `./tryapp.sh sm64` from NanoShell's root.
+
+**NOTE:** Currently builds for other platforms are broken, because it'll always build for NanoShell. This may be fixed in the future.
 
 ### Linux
 
